@@ -1,0 +1,6 @@
+[submodule "openvla-ROCKET/LIBERO"]
+	path = openvla-ROCKET/LIBERO
+	url = https://github.com/Lifelong-Robot-Learning/LIBERO.git
+[submodule "openvla-ROCKET/transformers-openvla-oft"]
+	path = openvla-ROCKET/transformers-openvla-oft
+	url = https://github.com/moojink/transformers-openvla-oft.git

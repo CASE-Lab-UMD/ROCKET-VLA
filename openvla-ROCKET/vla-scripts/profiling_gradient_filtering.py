@@ -1,0 +1,1842 @@
+"""
+finetune.py
+
+Fine-tunes OpenVLA via LoRA.
+"""
+
+import os
+import time
+import json
+from collections import deque
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Type
+
+import draccus
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+import tqdm
+import numpy as np
+from accelerate import PartialState
+from huggingface_hub import HfApi, snapshot_download
+from peft import LoraConfig, PeftModel, get_peft_model
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import MultiStepLR, CosineAnnealingLR
+from torch.utils.data import DataLoader
+from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq, AutoProcessor
+from transformers.modeling_outputs import CausalLMOutputWithPast
+
+import wandb
+# os.environ["WANDB_MODE"]="offline"
+
+from experiments.robot.openvla_utils import (
+    check_model_logic_mismatch,
+    model_is_on_hf_hub,
+    update_auto_map,
+)
+
+from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
+from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
+from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
+from prismatic.models.action_heads import DiffusionActionHead, L1RegressionActionHead
+from prismatic.models.backbones.llm.prompting import PurePromptBuilder
+from prismatic.models.film_vit_wrapper import FiLMedPrismaticVisionBackbone
+
+from prismatic.models.projectors_rocket import (
+    NoisyActionProjector,
+    ProprioProjector,
+    AlignProjector as AlignProjectorTW,
+)
+from prismatic.models.projectors_rocket import AlignProjector as AlignProjectorSimple
+from prismatic.training.train_utils import (
+    compute_actions_l1_loss,
+    compute_token_accuracy,
+    get_current_action_mask,
+    get_next_actions_mask,
+)
+from prismatic.util.data_utils import PaddedCollatorForActionPrediction
+from prismatic.util.pooling_utils import custom_pooling
+from prismatic.vla.action_tokenizer import ActionTokenizer
+from prismatic.vla.constants import (
+    ACTION_DIM,
+    ACTION_PROPRIO_NORMALIZATION_TYPE,
+    NUM_ACTIONS_CHUNK,
+    PROPRIO_DIM,
+)
+from prismatic.vla.datasets import RLDSBatchTransform, RLDSDataset
+from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
+from prismatic.vla.datasets.rlds.oxe import OXE_NAMED_MIXTURES
+import random
+
+from vggt.models.vggt import VGGT
+from vggt.utils.load_fn import preprocess_normed_images
+
+# Sane Defaults
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
+@dataclass
+class FinetuneConfig:
+    # fmt: off
+    vla_path: str = "openvla/openvla-7b"             # Path to OpenVLA model (on HuggingFace Hub or stored locally)
+    vggt_path: str = 'official_ckpts/vggt_model.pt'  # Path to VGGT model (on HuggingFace Hub or stored locally)
+
+    # Dataset
+    data_root_dir: Path = Path("datasets/rlds")      # Directory containing RLDS datasets
+    dataset_name: str = "aloha_scoop_x_into_bowl"    # Name of fine-tuning dataset (e.g., `aloha_scoop_x_into_bowl`)
+    run_root_dir: Path = Path("runs")                # Path to directory to store logs & checkpoints
+    shuffle_buffer_size: int = 100_000               # Dataloader shuffle buffer size (can reduce if OOM errors occur)
+    seed: int = 42                                   # Random seed for reproducibility
+
+    # Algorithm and architecture
+    align_loss_type: str = "cosine"                  # Loss function for alignment loss, "cosine"
+    align_loss_coeff: float = 0.5                          # Coefficient for alignment loss (multiplied by align_loss)
+    use_l1_regression: bool = True                   # If True, trains continuous action head with L1 regression objective
+    use_diffusion: bool = False                      # If True, trains continuous action head with diffusion modeling objective (DDIM)
+    num_diffusion_steps_train: int = 50              # (When `diffusion==True`) Number of diffusion steps used for training
+    use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
+    num_images_in_input: int = 1                     # Number of images in the VLA input (default: 1)
+    use_proprio: bool = False                        # If True, includes robot proprioceptive state in input
+    pooling_func: str = "bilinear"                   # resize VGGT state pixels to vla pixels
+    vla_layers_align: str = "-1"                     # Comma-separated string of VLA hidden state layers to align
+    vggt_layers_align: str = "-1"                    # Comma-separated string of VGGT hidden state layers to align
+    use_vlm_norm: bool = False                       # whether to use VLM normalization for the VLM output vision embeddings
+    use_vggt_pe: bool = False                        # position embedding for vggt state before pooling
+    gain_feat_1move: bool = True                     # whether to gain the VLA feature moved one position backward
+
+    share_projector: bool = False
+    ensemble_size: int = 1
+    
+    # Projector Dynamic Sub-network Config
+    projector_width_ratios: str = "None"             # Comma-separated ratios, e.g., "0.25,0.5,0.75,1.0". If "None", uses default linear.
+    projector_shallow_to_deep_increase: bool = True  # True: shallow layers use fewer params.
+
+    # VGGT Feature Cache Config
+    use_vggt_cache: bool = False                     # If True, load VGGT features from cache if available
+    generate_vggt_cache: bool = False                # If True, save computed VGGT features to cache
+    vggt_cache_dir: str = "vggt_features_cache"      # Directory to store cached features
+
+    # Training configuration
+    batch_size: int = 8                              # Batch size per device (total batch size = batch_size * num GPUs)
+    learning_rate: float = 5e-4                      # Learning rate
+    lr_warmup_steps: int = 0                         # Number of steps to warm up learning rate (from 10% to 100%)
+    num_steps_before_decay: int = 100_000            # Number of steps before LR decays by 10x
+    grad_accumulation_steps: int = 1                 # Number of gradient accumulation steps
+    max_steps: int = 200_000                         # Max number of training steps
+    use_val_set: bool = False                        # If True, uses validation set and log validation metrics
+    val_freq: int = 10_000                           # (When `use_val_set==True`) Validation set logging frequency in steps
+    val_time_limit: int = 180                        # (When `use_val_set==True`) Time limit for computing validation metrics
+    save_freq: int = 10_000                          # Checkpoint saving frequency in steps
+    save_latest_checkpoint_only: bool = False        # If True, saves only 1 checkpoint, overwriting latest checkpoint
+    scheduler: str = 'MultiStepLR'                   # "MultiStepLR" or "CosineAnnealingLR"
+                                                     #   (If False, saves all checkpoints)
+    resume: bool = False                             # If True, resumes from checkpoint
+    resume_step: Optional[int] = None                # (When `resume==True`) Step number that we are resuming from
+    image_aug: bool = True                           # If True, trains with image augmentations (HIGHLY RECOMMENDED)
+    diffusion_sample_freq: int = 50                  # (When `use_diffusion==True`) Frequency for sampling in steps
+
+    # LoRA
+    use_lora: bool = True                            # If True, uses LoRA fine-tuning
+    lora_rank: int = 32                              # Rank of LoRA weight matrix
+    lora_dropout: float = 0.0                        # Dropout applied to LoRA weights
+    merge_lora_during_training: bool = True          # If True, merges LoRA weights and saves result during training
+                                                     #   Note: Merging can be very slow on some machines. If so, set to
+                                                     #         False and merge final checkpoint offline!
+
+    # Logging
+    wandb_entity: str = "your-wandb-entity"          # Name of WandB entity
+    wandb_project: str = "your-wandb-project"        # Name of WandB project
+    run_id_note: Optional[str] = None                # Extra note to add to end of run ID for logging
+    run_id_override: Optional[str] = None            # Optional string to override the run ID with
+    wandb_log_freq: int = 10                         # WandB logging frequency in steps
+
+    # Profiling
+    profiling_start_step: int = 1000                 # Step to start profiling gradients
+    profiling_num_samples: int = 32                  # Number of samples to profile (replaces steps)
+    profiling_output_file: str = "profiling_results.json" # Output filename for profiling results
+    profiling_target_module: str = "llm_block_0"     # "projector" or "llm_block_0" (or other specific patterns)
+    profiling_target_layer_idx: int = 0              # Index of the transformer layer to profile (e.g. LoRA block index). -1 for first found.
+    use_simple_projector: bool = False               # If True, uses the simple AlignProjector from projectors.py
+
+
+    # fmt: on
+
+
+def remove_ddp_in_checkpoint(state_dict) -> dict:
+    """
+    Removes the 'module.' prefix from parameter names in a PyTorch model state dictionary that was saved using
+    DistributedDataParallel (DDP).
+
+    When a model is trained using PyTorch's DistributedDataParallel, the saved state dictionary contains parameters
+    prefixed with 'module.'. This function removes these prefixes to make the state dictionary compatible when
+    loading into models that are not yet wrapped in DDP.
+
+    Args:
+        state_dict (dict): PyTorch model state dictionary.
+
+    Returns:
+        dict: A new state dictionary with the same contents but with 'module.' prefixes removed from parameter names.
+              Parameters without the 'module.' prefix remain unchanged.
+    """
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        if k[:7] == "module.":
+            new_state_dict[k[7:]] = v
+        else:
+            new_state_dict[k] = v
+    return new_state_dict
+
+
+def get_run_id(cfg) -> str:
+    """
+    Generates or retrieves an identifier string for an experiment run.
+
+    Args:
+        cfg (FinetuneConfig): Training configuration.
+
+    Returns:
+        str: Experiment run ID.
+    """
+    if cfg.run_id_override is not None:
+        # Override the run ID with the user-provided ID
+        run_id = cfg.run_id_override
+    elif cfg.resume:
+        # Override run ID with the previous resumed run's ID
+        run_id = cfg.vla_path.split("/")[-1]
+        # Remove the "--XXX_chkpt" suffix from the run ID if it exists
+        if "chkpt" in run_id.split("--")[-1]:
+            run_id = "--".join(run_id.split("--")[:-1])
+    else:
+        run_id = (
+            f"{cfg.vla_path.split('/')[-1]}+{cfg.dataset_name}"
+            f"+b{cfg.batch_size * cfg.grad_accumulation_steps}"
+            f"+lr-{cfg.learning_rate}"
+        )
+        if cfg.use_lora:
+            run_id += f"+lora-r{cfg.lora_rank}+dropout-{cfg.lora_dropout}"
+        if cfg.image_aug:
+            run_id += "--image_aug"
+        if cfg.run_id_note is not None:
+            run_id += f"--{cfg.run_id_note}"
+    return run_id
+
+
+def load_checkpoint(module_name: str, path: str, step: int, device: str = "cpu") -> dict:
+    """
+    Loads a checkpoint for a given module.
+
+    Args:
+        module_name (str): Name of model component to load checkpoint for.
+        path (str): Path to checkpoint directory.
+        step (int): Gradient step number of saved checkpoint.
+        device (str): String specifying how to remap storage locations (default = "cpu").
+
+    Returns:
+        dict: PyTorch model state dictionary.
+    """
+    checkpoint_path = os.path.join(path, f"{module_name}--{step}_checkpoint.pt")
+    print(f"Loading checkpoint: {checkpoint_path}")
+    state_dict = torch.load(checkpoint_path, weights_only=True, map_location=device)
+    return remove_ddp_in_checkpoint(state_dict)
+
+
+def wrap_ddp(module: nn.Module, device_id: int, find_unused: bool = False) -> DDP:
+    """
+    Wrap a module with DistributedDataParallel.
+
+    Args:
+        module (nn.Module): PyTorch module.
+        device_id (str): Device ID.
+        find_unused (bool): Whether to detect parameters without gradients in distributed training.
+
+    Returns:
+        DistributedDataParallel: PyTorch module wrapped with DDP.
+    """
+    return DDP(module, device_ids=[device_id], find_unused_parameters=find_unused, gradient_as_bucket_view=True)
+
+
+def count_parameters(module: nn.Module, name: str) -> None:
+    """
+    Counts and prints the number of trainable parameters in a module.
+
+    Args:
+        module (nn.Module): PyTorch module.
+        module_name (str): Name of model component.
+
+    Returns:
+        None.
+    """
+    num_params = sum(p.numel() for p in module.parameters() if p.requires_grad)
+    print(f"# trainable params in {name}: {num_params}")
+
+
+def init_module(
+    module_class: Type[nn.Module],
+    module_name: str,
+    cfg: FinetuneConfig,
+    device_id: int,
+    module_args: dict,
+    to_bf16: bool = False,
+    find_unused_params: bool = False,
+) -> DDP:
+    """
+    Initializes a module, optionally loads checkpoint, moves to device, and wraps with DDP.
+
+    Args:
+        module_class (Type[nn.Module]): Class of PyTorch module to initialize.
+        module_name (str): Name of model component to load checkpoint for.
+        cfg (FinetuneConfig): Training configuration.
+        device_id (str): Device ID.
+        module_args (dict): Args for initializing the module.
+        to_bf16 (bool): Whether to convert to torch.bfloat16 data type.
+        find_unused_params (bool): Whether to detect parameters without gradients in distributed training.
+
+    Returns:
+        DistributedDataParallel: PyTorch module wrapped with DDP.
+    """
+    module = module_class(**module_args)
+    count_parameters(module, module_name)
+
+    if cfg.resume:
+        state_dict = load_checkpoint(module_name, cfg.vla_path, cfg.resume_step)
+        module.load_state_dict(state_dict)
+
+    if to_bf16:
+        module = module.to(torch.bfloat16)
+    module = module.to(device_id)
+
+    return wrap_ddp(module, device_id, find_unused_params)
+
+
+import hashlib
+
+def get_image_hash_keys(pixel_values):
+    """
+    Compute MD5 hash keys for a batch of images.
+    Args:
+        pixel_values: Tensor of shape (B, ...)
+    Returns:
+        List[str]: List of MD5 hash strings
+    """
+    # Move to CPU and numpy. Use float32 for consistency.
+    # pixel_values might be bfloat16 or float32.
+    imgs = pixel_values.detach().cpu().to(torch.float32).numpy()
+    keys = []
+    for img in imgs:
+        # img.tobytes() creates a raw byte string of the array data
+        # This is sensitive to exact pixel values.
+        keys.append(hashlib.md5(img.tobytes()).hexdigest())
+    return keys
+
+
+def run_forward_pass(
+    vla,
+    action_head,
+    noisy_action_projector,
+    proprio_projector,
+    align_projectors,
+    vggt,
+    pooling_func,
+    vla_layers_align,
+    vggt_layers_align,
+    use_vggt_pe,
+    gain_feat_1move,
+    processor,
+    batch,
+    action_tokenizer,
+    device_id,
+    align_loss_coeff,
+    use_l1_regression,
+    use_diffusion,
+    use_proprio,
+    use_film,
+    num_patches,
+    num_images_in_input=2,
+    compute_diffusion_l1=False,
+    num_diffusion_steps_train=None,
+    # VGGT Cache Args
+    use_vggt_cache=False,
+    generate_vggt_cache=False,
+    vggt_cache_dir=None,
+    return_individual_losses=False,
+) -> Tuple[torch.Tensor, Dict[str, float], Optional[List[torch.Tensor]]]:
+    """
+    Compute model forward pass and metrics for both training and validation.
+
+    Args:
+        vla (OpenVLAForActionPrediction): Vision-language-action policy.
+        action_head (nn.Module): Action head module.
+        noisy_action_projector (nn.Module): Noisy action projector module (only used for diffusion).
+        proprio_projector (nn.Module): Proprioceptive state projector module.
+        batch (dict): Input batch.
+        action_tokenizer (ActionTokenizer): Action tokenizer.
+        device_id (str): Device ID.
+        use_l1_regression (bool): Whether to use L1 regression.
+        use_diffusion (bool): Whether to use diffusion.
+        use_proprio (bool): Whether to use proprioceptive state as input.
+        use_film (bool): Whether to use FiLM for better language following.
+        num_patches (int): Number of vision patches.
+        compute_diffusion_l1 (bool): Whether to sample actions and compute L1 loss for diffusion (do this once every
+                                    diffusion_sample_freq steps during training; do it every batch for validation)
+        num_diffusion_steps_train (int): Number of diffusion steps for training (only used for diffusion).
+
+    Returns:
+        tuple: (loss, metrics_dict)
+            loss: The loss tensor with gradient for backpropagation.
+            metrics_dict: Dictionary of computed metrics (detached values for logging).
+    """
+    metrics = {}
+
+    # Get ground-truth action labels
+    ground_truth_actions = batch["actions"].to(device_id).to(torch.bfloat16)
+
+    # [Only for diffusion] Sample noisy actions used as input for noise predictor network
+    if use_diffusion:
+        noisy_dict = action_head.module.sample_noisy_actions(ground_truth_actions)
+        noise, noisy_actions, diffusion_timestep_embeddings = (
+            noisy_dict["noise"],
+            noisy_dict["noisy_actions"],
+            noisy_dict["diffusion_timestep_embeddings"],
+        )
+    else:
+        noise, noisy_actions, diffusion_timestep_embeddings = None, None, None
+
+    # VLA forward pass
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        output: CausalLMOutputWithPast = vla(
+            input_ids=batch["input_ids"].to(device_id),
+            attention_mask=batch["attention_mask"].to(device_id),
+            pixel_values=batch["pixel_values"].to(torch.bfloat16).to(device_id),
+            labels=batch["labels"],
+            output_hidden_states=True,
+            proprio=batch["proprio"] if use_proprio else None,
+            proprio_projector=proprio_projector if use_proprio else None,
+            noisy_actions=noisy_actions if use_diffusion else None,
+            noisy_action_projector=noisy_action_projector if use_diffusion else None,
+            diffusion_timestep_embeddings=diffusion_timestep_embeddings if use_diffusion else None,
+            use_film=use_film,
+        )
+
+    # Get action masks needed for logging
+    ground_truth_token_ids = batch["labels"][:, 1:].to(device_id)
+    current_action_mask = get_current_action_mask(ground_truth_token_ids)
+    next_actions_mask = get_next_actions_mask(ground_truth_token_ids)
+
+    # vla hidden states
+    projected_embeddings = output.projector_features
+    vision_length = projected_embeddings.shape[-2] - 1 if use_proprio else projected_embeddings.shape[-2]
+    boi_ids = 2 if gain_feat_1move else 1
+
+    # VGGT hidden states
+    vggt.eval()
+    
+    vggt_output = None
+    cache_keys = []
+    should_compute_vggt = True
+    
+    # Handle VGGT Caching
+    if (use_vggt_cache or generate_vggt_cache) and vggt_cache_dir:
+        os.makedirs(vggt_cache_dir, exist_ok=True)
+        # Compute keys for this batch using image hash
+        cache_keys = get_image_hash_keys(batch['pixel_values'])
+        
+        # Try to load if usage is enabled
+        if use_vggt_cache:
+            loaded_outputs = []
+            all_found = True
+            for key in cache_keys:
+                cache_path = os.path.join(vggt_cache_dir, f"{key}.pt")
+                if os.path.exists(cache_path):
+                    try:
+                        # Load directly to device
+                        loaded_outputs.append(torch.load(cache_path, map_location=device_id))
+                    except Exception as e:
+                        print(f"Error loading cache {cache_path}: {e}")
+                        all_found = False
+                        break
+                else:
+                    all_found = False
+                    break
+            
+            if all_found:
+                # Collate loaded outputs
+                patch_start_idx = loaded_outputs[0]["patch_start_idx"]
+                
+                # Stack features: List[List[Tensor]] -> List[Tensor] (one per layer)
+                num_layers = len(loaded_outputs[0]["features"])
+                stacked_features = []
+                for l in range(num_layers):
+                    # Stack the l-th layer feature across batch
+                    layer_feats = [item["features"][l] for item in loaded_outputs]
+                    stacked_features.append(torch.cat(layer_feats, dim=0))
+                
+                # Stack images
+                stacked_images = torch.cat([item["images"] for item in loaded_outputs], dim=0)
+                
+                vggt_output = {
+                    "features": stacked_features,
+                    "patch_start_idx": patch_start_idx,
+                    "images": stacked_images
+                }
+                should_compute_vggt = False
+    
+    if should_compute_vggt:
+        unnorm_imgs = preprocess_normed_images(
+            batch['pixel_values'], processor.image_processor, num_images_in_input
+        ).to(device_id)
+        with torch.autocast("cuda", dtype=torch.bfloat16), torch.no_grad():
+            vggt_output = vggt(unnorm_imgs)
+        
+        # Save if generation is enabled
+        if generate_vggt_cache and vggt_cache_dir and cache_keys:
+            B = len(cache_keys)
+            for b in range(B):
+                cache_path = os.path.join(vggt_cache_dir, f"{cache_keys[b]}.pt")
+                
+                # Check if already exists to avoid re-saving (e.g. in later epochs)
+                if os.path.exists(cache_path):
+                    continue
+
+                # Extract single sample output
+                sample_out = {
+                    "features": [f[b:b+1].clone() for f in vggt_output["features"]],
+                    "patch_start_idx": vggt_output["patch_start_idx"],
+                    "images": vggt_output["images"][b:b+1].clone()
+                }
+                torch.save(sample_out, cache_path)
+                
+                # Print size for the first saved sample (to avoid spamming)
+                if not hasattr(run_forward_pass, "has_printed_cache_size"):
+                    file_size_mb = os.path.getsize(cache_path) / (1024 * 1024)
+                    print(f"\n[VGGT Cache] Saved sample size: {file_size_mb:.2f} MB")
+                    print(f"[VGGT Cache] Path: {cache_path}\n")
+                    run_forward_pass.has_printed_cache_size = True
+
+
+    patch_start_idx = vggt_output["patch_start_idx"]
+    original_img = vggt_output["images"]
+
+    # Get image patch resolution for pooling
+    H, W = original_img.shape[-2:]
+    patch_h, patch_w = H // vggt.patch_size, W // vggt.patch_size
+
+    # calculate align loss
+    align_loss = 0
+    individual_align_losses = [] if return_individual_losses else None
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        # The projectors are wrapped in DDP, so we access them via .module
+        for i, layer_projectors in enumerate(align_projectors.module):
+            # Get VLA hidden state for the current layer to align
+            vla_hidden_i = output.hidden_states[vla_layers_align[i]]
+            vision_hidden_i = vla_hidden_i[:, boi_ids : vision_length + boi_ids, :].clone()
+
+            # Get VGGT hidden state for the current layer to align
+            agg_vggt_hidden_i = vggt_output["features"][vggt_layers_align[i]]
+            vggt_hidden_i = agg_vggt_hidden_i[:, :, patch_start_idx:, :]
+
+            # Resample VGGT hidden state
+            pooled_vggt_hidden_i = custom_pooling(
+                vggt_hidden_i, (patch_h, patch_w), (H, W), vision_hidden_i, pooling_func, use_vggt_pe
+            )
+
+            # Compute alignment loss for this pair of layers
+            current_layer_loss = 0
+            
+            # Record individual ensemble losses for this layer
+            for j, projector in enumerate(layer_projectors):
+                # Pass layer_index i to the projector if it's a shared dynamic projector
+                # If it's not shared (standard), num_layers=1, so index 0 (or -1) is fine.
+                # Since we iterate i from 0 to num_align_layers-1, we can just pass i.
+                # However, we need to handle the case where projectors are NOT shared but wrapped in list.
+                # If share_projector is False, we created independent projectors with num_layers=1.
+                # In that case, passing i > 0 might be out of bounds if we didn't handle it in AlignProjector.
+                # But AlignProjector clamps index: max(0, min(layer_index, self.num_layers - 1))
+                # So passing i is safe even for num_layers=1 (it will be clamped to 0).
+                
+                # Check if this projector instance is actually shared across layers or specific to this layer.
+                # But simpler: just pass i. The projector internals handle the mapping.
+                
+                # Simple projector forward only takes (vision_hidden_i, pooled_vggt_hidden_i)
+                # TW projector forward takes (vision_hidden_i, pooled_vggt_hidden_i, layer_index=i, rank=i)
+                
+                try:
+                    # Try calling with layer_index and rank (TW Projector)
+                    ens_loss = projector(vision_hidden_i, pooled_vggt_hidden_i, layer_index=i, rank=i)
+                except TypeError:
+                    # Fallback to simple projector call signature
+                    ens_loss = projector(vision_hidden_i, pooled_vggt_hidden_i)
+                    
+                metrics[f"align_loss_layer_{i}_ens_{j}"] = ens_loss.item()
+                current_layer_loss += ens_loss
+            
+            # Use mean over ensemble to keep scale consistent
+            if len(layer_projectors) > 0:
+                current_layer_loss = current_layer_loss / len(layer_projectors)
+            
+            metrics[f"align_loss_layer_{i}_avg"] = current_layer_loss.item()
+            if return_individual_losses:
+                individual_align_losses.append(current_layer_loss)
+            align_loss += current_layer_loss
+        align_loss /= len(align_projectors.module)
+    
+    # Add total and individual alignment losses to metrics for logging
+    metrics["align_loss"] = align_loss.item()
+    
+    # Compute average loss per projector index (across all layers)
+    num_layers = len(vla_layers_align)
+    if num_layers > 0:
+        # Assuming all layers have the same ensemble size
+        ens_size = len(align_projectors.module[0])
+        for j in range(ens_size):
+            avg_proj_loss = 0
+            for i in range(num_layers):
+                if f"align_loss_layer_{i}_ens_{j}" in metrics:
+                    avg_proj_loss += metrics[f"align_loss_layer_{i}_ens_{j}"]
+            metrics[f"align_loss_projector_{j}_avg"] = avg_proj_loss / num_layers
+    
+    # Compute metrics for discrete action representation (next-token prediction)
+    if not (use_l1_regression or use_diffusion):
+        loss = output.loss
+        predicted_token_ids = output.logits[:, num_patches:-1].argmax(dim=2)
+        curr_action_accuracy = compute_token_accuracy(
+            predicted_token_ids, ground_truth_token_ids, mask=current_action_mask
+        )
+        curr_action_l1_loss = compute_actions_l1_loss(
+            action_tokenizer, predicted_token_ids, ground_truth_token_ids, mask=current_action_mask
+        )
+        next_actions_accuracy = compute_token_accuracy(
+            predicted_token_ids, ground_truth_token_ids, mask=next_actions_mask
+        )
+        next_actions_l1_loss = compute_actions_l1_loss(
+            action_tokenizer, predicted_token_ids, ground_truth_token_ids, mask=next_actions_mask
+        )
+        metrics.update(
+            {
+                "loss_value": loss.item(),  # Detached value for logging
+                "curr_action_accuracy": curr_action_accuracy.item(),
+                "curr_action_l1_loss": curr_action_l1_loss.item(),
+                "next_actions_accuracy": next_actions_accuracy.item(),
+                "next_actions_l1_loss": next_actions_l1_loss.item(),
+            }
+        )
+    # Compute metrics for continuous action representations (L1 regression | diffusion)
+    else:
+        # Get last layer hidden states
+        last_hidden_states = output.hidden_states[-1]  # (B, seq_len, D)
+        # Get hidden states for text portion of prompt+response (after the vision patches)
+        text_hidden_states = last_hidden_states[:, num_patches:-1]
+        # Get hidden states for action portion of response
+        batch_size = batch["input_ids"].shape[0]
+        actions_hidden_states = (
+            text_hidden_states[current_action_mask | next_actions_mask]
+            .reshape(batch_size, NUM_ACTIONS_CHUNK * ACTION_DIM, -1)
+            .to(torch.bfloat16)
+        )  # (B, act_chunk_len, D)
+
+        if use_l1_regression:
+            # Predict action
+            predicted_actions = action_head.module.predict_action(actions_hidden_states)
+            # Get full L1 loss
+            loss = torch.nn.L1Loss()(ground_truth_actions, predicted_actions)
+
+        if use_diffusion:
+            # Predict noise
+            noise_pred = action_head.module.predict_noise(actions_hidden_states)
+            # Get diffusion noise prediction MSE loss
+            noise_pred = noise_pred.reshape(noise.shape)
+            loss = nn.functional.mse_loss(noise_pred, noise, reduction="mean")
+
+            # Only sample actions and compute L1 losses if specified
+            if compute_diffusion_l1:
+                with torch.no_grad():
+                    predicted_actions = run_diffusion_sampling(
+                        vla=vla,
+                        action_head=action_head,
+                        noisy_action_projector=noisy_action_projector,
+                        proprio_projector=proprio_projector,
+                        batch=batch,
+                        batch_size=batch_size,
+                        num_patches=num_patches,
+                        actions_shape=ground_truth_actions.shape,
+                        device_id=device_id,
+                        current_action_mask=current_action_mask,
+                        next_actions_mask=next_actions_mask,
+                        use_proprio=use_proprio,
+                        use_film=use_film,
+                    )
+
+        metrics.update(
+            {
+                "loss_value": loss.item(),  # Detached value for logging
+            }
+        )
+
+        # Get detailed L1 losses for logging
+        should_log_l1_loss = not use_diffusion or (use_diffusion and compute_diffusion_l1)
+        if should_log_l1_loss:
+            ground_truth_curr_action = ground_truth_actions[:, 0]
+            predicted_curr_action = predicted_actions[:, 0]
+            ground_truth_next_actions = ground_truth_actions[:, 1:]
+            predicted_next_actions = predicted_actions[:, 1:]
+            curr_action_l1_loss = torch.nn.L1Loss()(ground_truth_curr_action, predicted_curr_action)
+            next_actions_l1_loss = torch.nn.L1Loss()(ground_truth_next_actions, predicted_next_actions)
+            metrics.update(
+                {
+                    "curr_action_l1_loss": curr_action_l1_loss.item(),
+                    "next_actions_l1_loss": next_actions_l1_loss.item(),
+                }
+            )
+
+    # Return both the loss tensor (with gradients) and the metrics dictionary (with detached values)
+    total_loss = loss + align_loss * align_loss_coeff
+    metrics["total_loss"] = total_loss.item()
+    return total_loss, metrics, individual_align_losses
+
+
+def run_diffusion_sampling(
+    vla,
+    action_head,
+    noisy_action_projector,
+    proprio_projector,
+    batch,
+    batch_size,
+    num_patches,
+    actions_shape,
+    device_id,
+    current_action_mask,
+    next_actions_mask,
+    use_proprio,
+    use_film,
+) -> torch.Tensor:
+    """
+    Run diffusion sampling (reverse diffusion) to generate actions.
+
+    Args:
+        vla (OpenVLAForActionPrediction): Vision-language-action policy.
+        action_head (nn.Module): Action head module.
+        noisy_action_projector (nn.Module): Noisy action projector module (only used for diffusion).
+        proprio_projector (nn.Module): Proprioceptive state projector module.
+        batch (dict): Input batch.
+        batch_size (int): Batch size.
+        num_patches (int): Number of vision patches.
+        actions_shape (tuple): Shape of ground-truth actions.
+        device_id (str): Device ID.
+        current_action_mask (torch.Tensor): Mask for current action.
+        next_actions_mask (torch.Tensor): Mask for next actions.
+        use_proprio (bool): Whether to use proprioceptive state as input.
+        use_film (bool): Whether to use FiLM for better language following.
+
+    Returns:
+        torch.Tensor: Predicted actions.
+    """
+    # Sample random noisy action, used as the starting point for reverse diffusion
+    noise = torch.randn(
+        size=(batch_size, NUM_ACTIONS_CHUNK, ACTION_DIM),
+        device=device_id,
+        dtype=torch.bfloat16,
+    )  # (B, chunk_len, action_dim)
+
+    # Set diffusion timestep values
+    action_head.module.noise_scheduler.set_timesteps(action_head.module.num_diffusion_steps_train)
+
+    # Reverse diffusion: Iteratively denoise to generate action, conditioned on observation
+    curr_noisy_actions = noise
+    for t in action_head.module.noise_scheduler.timesteps:
+        # Get diffusion model's noise prediction (conditioned on VLA latent embedding, current noisy action embedding,
+        # and diffusion timestep embedding)
+        timesteps = torch.Tensor([t]).repeat(batch_size).to(device_id)
+        diffusion_timestep_embeddings = (
+            action_head.module.time_encoder(timesteps).to(curr_noisy_actions.dtype).to(curr_noisy_actions.device)
+        )  # (B, llm_dim)
+        diffusion_timestep_embeddings = diffusion_timestep_embeddings.unsqueeze(1)  # (B, 1, llm_dim)
+
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            output = vla(
+                input_ids=batch["input_ids"].to(device_id),
+                attention_mask=batch["attention_mask"].to(device_id),
+                pixel_values=batch["pixel_values"].to(torch.bfloat16).to(device_id),
+                labels=batch["labels"],
+                output_hidden_states=True,
+                proprio=batch["proprio"] if use_proprio else None,
+                proprio_projector=proprio_projector if use_proprio else None,
+                noisy_actions=curr_noisy_actions,
+                noisy_action_projector=noisy_action_projector,
+                diffusion_timestep_embeddings=diffusion_timestep_embeddings,
+                use_film=use_film,
+            )
+            # Get last layer hidden states
+            last_hidden_states = output.hidden_states[-1]  # (B, seq_len, D)
+            # Get hidden states for text portion of prompt+response (after the vision patches)
+            text_hidden_states = last_hidden_states[:, num_patches:-1]
+            # Get hidden states for action portion of response
+            actions_hidden_states = text_hidden_states[current_action_mask | next_actions_mask].reshape(
+                batch_size, NUM_ACTIONS_CHUNK * ACTION_DIM, -1
+            )  # (B, act_chunk_len, D)
+            actions_hidden_states = actions_hidden_states.to(torch.bfloat16)
+            # Predict noise
+            noise_pred = action_head.module.predict_noise(actions_hidden_states)
+
+        # Compute the action at the previous diffusion timestep: x_t -> x_{t-1}
+        curr_noisy_actions = action_head.module.noise_scheduler.step(noise_pred, t, curr_noisy_actions).prev_sample
+
+    return curr_noisy_actions.reshape(actions_shape)
+
+
+def compute_smoothened_metrics(metrics_deques) -> dict:
+    """
+    Compute smoothened metrics from recent deques.
+
+    Args:
+        metrics_deques (dict): Dictionary of deques containing recent metrics.
+
+    Returns:
+        dict: Dictionary of smoothened metrics.
+    """
+    smoothened_metrics = {}
+    for name, deque in metrics_deques.items():
+        if deque and len(deque) > 0:
+            smoothened_metrics[name] = sum(deque) / len(deque)
+    return smoothened_metrics
+
+
+def log_metrics_to_wandb(metrics, prefix, step, wandb_entity) -> None:
+    """
+    Log metrics to Weights & Biases.
+
+    Args:
+        metrics (dict): Dictionary of metrics to log
+        prefix (str): Prefix for metric names
+        step (int): Training step
+        wandb_entity (str): W&B entity instance
+
+    Returns:
+        None.
+    """
+    log_dict = {}
+    for name, value in metrics.items():
+        # Map loss_value to Loss for better readability in W&B
+        if name == "loss_value":
+            log_dict[f"{prefix}/Loss"] = value
+        # Move detailed align losses (not averages) to a separate section
+        elif "align_loss" in name and not name.endswith("avg") and name != "align_loss":
+            log_dict[f"{prefix} Detailed/{name.replace('_', ' ').title()}"] = value
+        # Keep other metrics as is
+        else:
+            log_dict[f"{prefix}/{name.replace('_', ' ').title()}"] = value
+    wandb_entity.log(log_dict, step=step)
+
+
+def save_training_checkpoint(
+    cfg,
+    run_dir,
+    log_step,
+    vla,
+    processor,
+    proprio_projector,
+    noisy_action_projector,
+    align_projectors,
+    action_head,
+    train_dataset,
+    distributed_state,
+) -> None:
+    """
+    Save all training checkpoints including model components, LoRA adapter, and dataset statistics.
+
+    Args:
+        cfg (FinetuneConfig): Training configuration.
+        run_dir (Path): Experiment run directory path.
+        log_step (int): Current logging step.
+        vla (OpenVLAForActionPrediction): Vision-language-action policy.
+        processor (PrismaticProcessor): OpenVLA inputs processor.
+        proprio_projector (nn.Module): Proprioceptive state projector module.
+        noisy_action_projector (nn.Module): Noisy action projector module (only used for diffusion).
+        align_projectors (nn.Module): Align the dimensions of VLA to VGGT hidden states.
+        action_head (nn.Module): Action head module.
+        train_dataset (RLDSDataset): Training dataset.
+        distributed_state (PartialState): Distributed training state.
+
+    Returns:
+        None.
+    """
+    # Determine checkpoint paths and naming
+    if cfg.save_latest_checkpoint_only:
+        checkpoint_dir = run_dir
+        checkpoint_name_suffix = "latest_checkpoint.pt"
+    else:
+        checkpoint_dir = Path(str(run_dir) + f"--{log_step}_chkpt")
+        checkpoint_name_suffix = f"{log_step}_checkpoint.pt"
+
+    adapter_dir = checkpoint_dir / "lora_adapter"
+
+    # Create directories and save dataset statistics (main process only)
+    if distributed_state.is_main_process:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        os.makedirs(adapter_dir, exist_ok=True)
+        save_dataset_statistics(train_dataset.dataset_statistics, checkpoint_dir)
+        print(f"Saving Model Checkpoint for Step {log_step}")
+
+    # Wait for directories to be created
+    dist.barrier()
+
+    # Save model components (main process only)
+    if distributed_state.is_main_process:
+        # Save processor and LoRA adapter
+        processor.save_pretrained(checkpoint_dir)
+        vla.module.save_pretrained(adapter_dir)
+
+        # Save other components
+        if cfg.use_proprio and proprio_projector is not None:
+            torch.save(proprio_projector.state_dict(), checkpoint_dir / f"proprio_projector--{checkpoint_name_suffix}")
+
+        if cfg.use_diffusion and noisy_action_projector is not None:
+            torch.save(
+                noisy_action_projector.state_dict(), checkpoint_dir / f"noisy_action_projector--{checkpoint_name_suffix}"
+            )
+        if cfg.align_loss_type in ['cosine'] and align_projectors is not None:
+            torch.save(align_projectors.state_dict(), checkpoint_dir / f"align_projectors--{checkpoint_name_suffix}")
+        if (cfg.use_l1_regression or cfg.use_diffusion) and action_head is not None:
+            torch.save(action_head.state_dict(), checkpoint_dir / f"action_head--{checkpoint_name_suffix}")
+
+        if cfg.use_film:
+            # To be safe, just save the entire vision backbone (not just FiLM components)
+            torch.save(
+                vla.module.vision_backbone.state_dict(), checkpoint_dir / f"vision_backbone--{checkpoint_name_suffix}"
+            )
+
+    # Wait for model components to be saved
+    dist.barrier()
+
+    # Merge LoRA weights into base model and save resulting model checkpoint
+    # Note: Can be very slow on some devices; if so, we recommend merging offline
+    if cfg.use_lora and cfg.merge_lora_during_training:
+        base_vla = AutoModelForVision2Seq.from_pretrained(
+            cfg.vla_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True
+        )
+        merged_vla = PeftModel.from_pretrained(base_vla, adapter_dir)
+        merged_vla = merged_vla.merge_and_unload()
+
+        if distributed_state.is_main_process:
+            merged_vla.save_pretrained(checkpoint_dir)
+            print(f"Saved merged model for Step {log_step} at: {checkpoint_dir}")
+
+        # Wait for merged model to be saved
+        dist.barrier()
+
+
+def run_validation(
+    vla,
+    action_head,
+    noisy_action_projector,
+    proprio_projector,
+    align_projectors,
+    val_dataloader,
+    action_tokenizer,
+    device_id,
+    cfg,
+    num_patches,
+    log_step,
+    distributed_state,
+    val_time_limit,
+    vggt,
+    processor,
+) -> None:
+    """
+    Compute validation set metrics for logging.
+
+    Args:
+        vla (OpenVLAForActionPrediction): Vision-language-action policy.
+        action_head (nn.Module): Action head module.
+        noisy_action_projector (nn.Module): Noisy action projector module (only used for diffusion).
+        proprio_projector (nn.Module): Proprioceptive state projector module.
+        align_projectors (nn.Module): Align the dimensions of VLA to VGGT hidden states.
+        val_dataloader (DataLoader): Validation data loader.
+        action_tokenizer (ActionTokenizer): Action tokenizer.
+        device_id (str): Device ID.
+        cfg (FinetuneConfig): Training configuration.
+        num_patches (int): Number of vision patches.
+        log_step (int): Current logging step.
+        distributed_state (PartialState): Distributed training state.
+        val_time_limit (int): Time limit for computing validation metrics.
+
+    Returns:
+        None.
+    """
+    val_start_time = time.time()
+    vla.eval()
+    val_batches_count = 0
+
+    # List to store validation metrics
+    all_val_metrics = []
+
+    with torch.no_grad():
+        for batch in val_dataloader:
+            # Always compute L1 loss for validation, even for diffusion
+            _, metrics, _ = run_forward_pass(
+                vla=vla,
+                action_head=action_head,
+                noisy_action_projector=noisy_action_projector,
+                proprio_projector=proprio_projector,
+                align_projectors=align_projectors,
+                vggt=vggt,
+                pooling_func=cfg.pooling_func,
+                vla_layers_align=cfg.vla_layers_align,
+                vggt_layers_align=cfg.vggt_layers_align,
+                use_vggt_pe=cfg.use_vggt_pe,
+                gain_feat_1move=cfg.gain_feat_1move,
+                processor=processor,
+                batch=batch,
+                action_tokenizer=action_tokenizer,
+                device_id=device_id,
+                align_loss_coeff=cfg.align_loss_coeff,
+                use_l1_regression=cfg.use_l1_regression,
+                use_diffusion=cfg.use_diffusion,
+                use_proprio=cfg.use_proprio,
+                use_film=cfg.use_film,
+                num_patches=num_patches,
+                num_images_in_input=cfg.num_images_in_input,
+                compute_diffusion_l1=True,
+                num_diffusion_steps_train=cfg.num_diffusion_steps_train if cfg.use_diffusion else None,
+                use_vggt_cache=cfg.use_vggt_cache,
+                generate_vggt_cache=cfg.generate_vggt_cache,
+                vggt_cache_dir=cfg.vggt_cache_dir,
+            )
+
+            # Add the loss value to the metrics
+            metrics["loss"] = metrics["loss_value"]
+            all_val_metrics.append(metrics)
+            val_batches_count += 1
+
+            # Cut testing on validation set short if it exceeds time limit
+            if time.time() - val_start_time > val_time_limit:
+                break
+
+    # Compute average validation metrics
+    avg_val_metrics = {}
+    for metric_name in all_val_metrics[0].keys():
+        values = [metrics[metric_name] for metrics in all_val_metrics if metric_name in metrics]
+        if values:
+            avg_val_metrics[metric_name] = sum(values) / len(values)
+
+    # Add batch count to metrics
+    avg_val_metrics["val_batches_count"] = val_batches_count
+
+    # Log validation metrics to W&B
+    if distributed_state.is_main_process:
+        log_metrics_to_wandb(avg_val_metrics, "VLA Val", log_step, wandb)
+
+
+@draccus.wrap()
+def finetune(cfg: FinetuneConfig) -> None:
+    """
+    Fine-tunes base VLA on demonstration dataset via LoRA.
+
+    Allows toggling different action representations (discrete vs. continuous), different learning objectives
+    (next-token prediction vs. L1 regression vs. diffusion), FiLM. Also allows for additional model inputs,
+    such as additional camera images and robot proprioceptive state. Assumes parallel action generation with
+    action chunking.
+
+    Args:
+        cfg (FinetuneConfig): Training configuration.
+
+    Returns:
+        None.
+    """
+    # Set random seeds for reproducibility
+    random.seed(cfg.seed)
+    np.random.seed(cfg.seed)
+    torch.manual_seed(cfg.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(cfg.seed)
+
+    # Parse comma-separated layer alignment strings into lists of ints
+    cfg.vla_layers_align = [int(x) for x in cfg.vla_layers_align.split(',')]
+    cfg.vggt_layers_align = [int(x) for x in cfg.vggt_layers_align.split(',')]
+    
+    # We will check sorting after resolving -1 to the actual last layer index
+
+    assert cfg.use_lora, "Only LoRA fine-tuning is supported. Please set --use_lora=True!"
+    assert not (cfg.use_l1_regression and cfg.use_diffusion), (
+        "Cannot do both L1 regression and diffusion. Please pick one of them!"
+    )
+
+    # Trim trailing forward slash ('/') in VLA path if it exists
+    cfg.vla_path = cfg.vla_path.rstrip("/")
+    print(f"Fine-tuning OpenVLA Model `{cfg.vla_path}` on `{cfg.dataset_name}`")
+
+    # Get experiment run ID
+    run_id = get_run_id(cfg)
+
+    # Create experiment run directory
+    run_dir = cfg.run_root_dir / run_id
+    os.makedirs(run_dir, exist_ok=True)
+
+    # GPU setup
+    distributed_state = PartialState()
+    device_id = distributed_state.local_process_index
+    torch.cuda.set_device(device_id)
+    torch.cuda.empty_cache()
+
+    # Initialize wandb logging
+    if distributed_state.is_main_process:
+        wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project, name=run_id)
+
+    # Print detected constants
+    print(
+        "Detected constants:\n"
+        f"\tNUM_ACTIONS_CHUNK: {NUM_ACTIONS_CHUNK}\n"
+        f"\tACTION_DIM: {ACTION_DIM}\n"
+        f"\tPROPRIO_DIM: {PROPRIO_DIM}\n"
+        f"\tACTION_PROPRIO_NORMALIZATION_TYPE: {ACTION_PROPRIO_NORMALIZATION_TYPE}"
+    )
+
+    # Two options:
+    # (1) Base model is on Hugging Face Hub
+    #   - Then download it and record the path to the download directory
+    # (2) Base model is stored locally
+    #   - Then register model config in HF Auto Classes
+    # In both cases, we want to check whether any changes have been made to
+    # the `modeling_prismatic.py` file in this codebase; if so, we will copy
+    # the file to the downloaded or locally stored checkpoint directory so
+    # that the user's changes to the VLA class logic go into effect
+    if model_is_on_hf_hub(cfg.vla_path):
+        # Download model directly from Hugging Face Hub
+        vla_download_path = snapshot_download(repo_id=cfg.vla_path)
+        # Overwrite VLA path
+        cfg.vla_path = vla_download_path
+    else:
+        # Register OpenVLA model to HF Auto Classes (not needed if the model is on HF Hub)
+        AutoConfig.register("openvla", OpenVLAConfig)
+        AutoImageProcessor.register(OpenVLAConfig, PrismaticImageProcessor)
+        AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
+        AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
+
+    # Update config.json and sync model files
+    if distributed_state.is_main_process:
+        update_auto_map(cfg.vla_path)
+        check_model_logic_mismatch(cfg.vla_path)
+
+    # Wait for model files to be synced
+    dist.barrier()
+
+    # Load processor and VLA
+    processor = AutoProcessor.from_pretrained(cfg.vla_path, trust_remote_code=True)
+    vla = AutoModelForVision2Seq.from_pretrained(
+        cfg.vla_path,
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
+        trust_remote_code=True,
+    ).to(device_id)
+
+    # Resolve -1 in vla_layers_align to actual layer indices and check sorting
+    # Try to find num_layers from config
+    if hasattr(vla.config, "text_config") and hasattr(vla.config.text_config, "num_hidden_layers"):
+        total_layers = vla.config.text_config.num_hidden_layers
+    elif hasattr(vla.config, "num_hidden_layers"):
+        total_layers = vla.config.num_hidden_layers
+    else:
+        # Fallback: try to guess from model structure or default to 32 (Llama-2-7b standard)
+        print("Warning: Could not automatically determine num_hidden_layers from config. Assuming 32.")
+        total_layers = 32
+
+    # Replace -1 with actual last layer index
+    cfg.vla_layers_align = [
+        (l if l != -1 else total_layers - 1) for l in cfg.vla_layers_align
+    ]
+    
+    # Ensure vla_layers_align is sorted ascendingly
+    assert cfg.vla_layers_align == sorted(cfg.vla_layers_align), \
+        f"vla_layers_align must be sorted in ascending order for dynamic projector allocation! Got: {cfg.vla_layers_align}"
+
+    # Set number of images in VLA input
+    vla.vision_backbone.set_num_images_in_input(cfg.num_images_in_input)
+
+    # LoRA setup
+    if cfg.use_lora:
+        lora_config = LoraConfig(
+            r=cfg.lora_rank,
+            lora_alpha=min(cfg.lora_rank, 16),
+            lora_dropout=cfg.lora_dropout,
+            target_modules="all-linear",
+            init_lora_weights="gaussian",
+        )
+        vla = get_peft_model(vla, lora_config)
+        vla.print_trainable_parameters()
+
+    # FiLM setup
+    if cfg.use_film:
+        count_parameters(vla.vision_backbone, "vla.vision_backbone (original)")
+        # Wrap vision backbone with FiLM wrapper
+        # Important: For this, must specify `vla.model.vision_backbone` instead of just `vla.vision_backbone`, since the
+        # latter would cause the new wrapped backbone to be saved as a new attribute of `vla` instead of overwriting the
+        # original one (due to the LoRA wrapper)
+        vla.model.vision_backbone = FiLMedPrismaticVisionBackbone(
+            vision_backbone=vla.model.vision_backbone,
+            llm_dim=vla.llm_dim,
+        )
+        count_parameters(vla.vision_backbone, "vla.vision_backbone (post-wrap)")
+        if cfg.resume:
+            state_dict = load_checkpoint("vision_backbone", cfg.vla_path, cfg.resume_step)
+            vla.model.vision_backbone.load_state_dict(state_dict)
+        vla.model.vision_backbone = vla.model.vision_backbone.to(device_id)
+
+    # Wrap VLA with DDP
+    vla = wrap_ddp(vla, device_id, find_unused=True)
+
+    # load VGGT in val mode to only utilize its feature extractor
+    vggt_model = VGGT(
+        enable_camera=False,
+        enable_point=False,
+        enable_depth=False,
+        enable_track=False,
+        feature_only=True,
+    )
+    vggt_model.load_state_dict(torch.load(cfg.vggt_path), strict=False)
+    vggt_model = vggt_model.to(device_id)
+
+    # Assert that the layer alignment lists are of the same length
+    assert len(cfg.vla_layers_align) == len(cfg.vggt_layers_align), \
+        "vla_layers_align and vggt_layers_align must be lists of the same length!"
+
+    # Initialize a ModuleList of AlignProjectors
+    # Parse width ratios
+    if cfg.projector_width_ratios == "None":
+        width_ratios = None
+    else:
+        width_ratios = [float(x) for x in cfg.projector_width_ratios.split(',')]
+    
+    num_align_layers = len(cfg.vla_layers_align)
+
+    # Choose projector class based on config
+    if cfg.use_simple_projector:
+        AlignProjectorClass = AlignProjectorSimple
+        print(f"Using Simple AlignProjector from prismatic.models.projectors")
+    else:
+        AlignProjectorClass = AlignProjectorTW
+        print(f"Using AlignProjectorTW from prismatic.models.projectors_rocket")
+
+    if cfg.share_projector:
+        if cfg.use_simple_projector:
+             shared_projectors_pool = nn.ModuleList([
+                AlignProjectorClass(
+                    llm_dim=vla.module.llm_dim,
+                    vggt_dim=vggt_model.embed_dim,
+                    align_loss_type=cfg.align_loss_type,
+                    use_vlm_norm=cfg.use_vlm_norm,
+                    # Simple projector does not take num_layers, width_ratios, shallow_to_deep_increase
+                ) for _ in range(cfg.ensemble_size)
+            ])
+        else:
+            shared_projectors_pool = nn.ModuleList([
+                AlignProjectorClass(
+                    llm_dim=vla.module.llm_dim,
+                    vggt_dim=vggt_model.embed_dim,
+                    align_loss_type=cfg.align_loss_type,
+                    use_vlm_norm=cfg.use_vlm_norm,
+                    num_layers=num_align_layers,
+                    width_ratios=width_ratios,
+                    shallow_to_deep_increase=cfg.projector_shallow_to_deep_increase,
+                ) for _ in range(cfg.ensemble_size)
+            ])
+        print(f"Using shared projector ensemble size: {cfg.ensemble_size}")
+        # Note: shared_projectors_pool elements already know how to handle different layers via layer_index
+        align_projectors_list = [shared_projectors_pool for _ in cfg.vla_layers_align]
+    else:
+        # If not sharing projectors, each layer gets its own full-capacity projector (effectively num_layers=1)
+        # Or you might want to still enforce the capacity constraint but with independent weights.
+        # Here assuming independent projectors means "standard" usage, so we default to full capacity.
+        # But to keep consistent API, we can just pass num_layers=1 or similar.
+        # Let's keep it simple: if not shared, standard full projector for each layer.
+        if cfg.use_simple_projector:
+             align_projectors_list = [
+                nn.ModuleList([
+                    AlignProjectorClass(
+                        llm_dim=vla.module.llm_dim,
+                        vggt_dim=vggt_model.embed_dim,
+                        align_loss_type=cfg.align_loss_type,
+                        use_vlm_norm=cfg.use_vlm_norm,
+                    ) for _ in range(cfg.ensemble_size)
+                ]) for _ in cfg.vla_layers_align
+            ]
+        else:
+            align_projectors_list = [
+                nn.ModuleList([
+                    AlignProjectorClass(
+                        llm_dim=vla.module.llm_dim,
+                        vggt_dim=vggt_model.embed_dim,
+                        align_loss_type=cfg.align_loss_type,
+                        use_vlm_norm=cfg.use_vlm_norm,
+                        num_layers=1, # Independent projectors don't need layer-aware slicing
+                    ) for _ in range(cfg.ensemble_size)
+                ]) for _ in cfg.vla_layers_align
+            ]
+    align_projectors = nn.ModuleList(align_projectors_list).to(device_id)
+    count_parameters(align_projectors, "align_projectors")
+
+    if cfg.resume:
+        state_dict = load_checkpoint("align_projectors", cfg.vla_path, cfg.resume_step)
+        align_projectors.load_state_dict(state_dict)
+
+    align_projectors = wrap_ddp(align_projectors, device_id)
+
+    # If applicable, instantiate proprio projector
+    if cfg.use_proprio:
+        proprio_projector = init_module(
+            ProprioProjector,
+            "proprio_projector",
+            cfg,
+            device_id,
+            {"llm_dim": vla.module.llm_dim, "proprio_dim": PROPRIO_DIM},
+        )
+
+    # If applicable, instantiate continuous action head for L1 regression
+    if cfg.use_l1_regression:
+        action_head = init_module(
+            L1RegressionActionHead,
+            "action_head",
+            cfg,
+            device_id,
+            {"input_dim": vla.module.llm_dim, "hidden_dim": vla.module.llm_dim, "action_dim": ACTION_DIM},
+            to_bf16=True,
+        )
+
+    # If applicable, instantiate diffusion action head and noisy action projector
+    if cfg.use_diffusion:
+        action_head = init_module(
+            DiffusionActionHead,
+            "action_head",
+            cfg,
+            device_id,
+            {
+                "input_dim": vla.module.llm_dim,
+                "hidden_dim": vla.module.llm_dim,
+                "action_dim": ACTION_DIM,
+                "num_diffusion_steps_train": cfg.num_diffusion_steps_train,
+            },
+            to_bf16=True,
+        )
+        noisy_action_projector = init_module(
+            NoisyActionProjector, "noisy_action_projector", cfg, device_id, {"llm_dim": vla.module.llm_dim}
+        )
+
+    # Get number of vision patches
+    NUM_PATCHES = vla.module.vision_backbone.get_num_patches() * vla.module.vision_backbone.get_num_images_in_input()
+    # If we have proprio inputs, a single proprio embedding is appended to the end of the vision patch embeddings
+    if cfg.use_proprio:
+        NUM_PATCHES += 1
+    # For diffusion, a single diffusion timestep embedding is appended to the end of the vision patch embeddings
+    if cfg.use_diffusion:
+        NUM_PATCHES += 1
+
+    # Instantiate optimizer
+    trainable_params = [param for param in vla.parameters() if param.requires_grad]
+    if cfg.use_l1_regression or cfg.use_diffusion:
+        trainable_params += [param for param in action_head.parameters() if param.requires_grad]
+    if cfg.align_loss_type in ["cosine"]:
+        trainable_params += [param for param in align_projectors.parameters() if param.requires_grad]
+    if cfg.use_diffusion:
+        trainable_params += [param for param in noisy_action_projector.parameters() if param.requires_grad]
+    if cfg.use_proprio:
+        trainable_params += [param for param in proprio_projector.parameters() if param.requires_grad]
+
+    # Print detailed parameter counts
+    total_params = sum(p.numel() for p in trainable_params)
+    print(f"\n{'='*20} Trainable Parameter Counts {'='*20}")
+    print(f"Total: {total_params:,}")
+
+    vla_params = sum(p.numel() for p in vla.parameters() if p.requires_grad)
+    print(f"  - VLA (LoRA/FiLM): {vla_params:,} ({vla_params / total_params:.1%})")
+
+    if cfg.align_loss_type in ["cosine"]:
+        proj_params = sum(p.numel() for p in align_projectors.parameters() if p.requires_grad)
+        print(f"  - Align Projectors: {proj_params:,} ({proj_params / total_params:.1%})")
+
+    if cfg.use_l1_regression or cfg.use_diffusion:
+        head_params = sum(p.numel() for p in action_head.parameters() if p.requires_grad)
+        print(f"  - Action Head: {head_params:,} ({head_params / total_params:.1%})")
+
+    print(f"{'='*66}\n")
+
+    optimizer = AdamW(trainable_params, lr=cfg.learning_rate)
+
+    # Record original learning rate
+    original_lr = optimizer.param_groups[0]["lr"]
+
+    # Create learning rate scheduler
+    if cfg.scheduler == 'MultiStepLR':
+        scheduler = MultiStepLR(
+            optimizer,
+            milestones=[cfg.num_steps_before_decay],  # Number of steps after which LR will change
+            gamma=0.1,  # Multiplicative factor of learning rate decay
+        )
+    elif cfg.scheduler == 'CosineAnnealingLR':
+        scheduler = CosineAnnealingLR(
+            optimizer,
+            T_max=cfg.max_steps,  # Total number of steps for the cosine annealing
+            eta_min=cfg.learning_rate * 1e-3,
+        )
+    else:
+        raise ValueError(f"Unsupported scheduler type: {cfg.scheduler}")
+
+    # Create Action Tokenizer
+    action_tokenizer = ActionTokenizer(processor.tokenizer)
+
+    # Load Fine-tuning Dataset =>> note that we use an RLDS-formatted dataset following Open X-Embodiment by default.
+    #   =>> If you want to use a non-RLDS dataset (e.g., a standard PyTorch Dataset) see the following commented block.
+    #   =>> Note that our training code does not loop over epochs because the RLDS loader does this implicitly; if using
+    #       your own Dataset, make sure to add the appropriate logic to the training loop!
+    #
+    # ---
+    # from prismatic.vla.datasets import DummyDataset
+    #
+    # train_dataset = DummyDataset(
+    #     action_tokenizer,
+    #     processor.tokenizer,
+    #     image_transform=processor.image_processor.apply_transform,
+    #     prompt_builder_fn=PurePromptBuilder,
+    # )
+    # ---
+
+    # We assume that the model takes as input one third-person camera image and 1 or 2 optional wrist camera image(s)
+    use_wrist_image = cfg.num_images_in_input > 1
+
+    # Create training and optional validation datasets
+    dataset_names = [name.strip() for name in cfg.dataset_name.split(',')]
+    if len(dataset_names) > 1:
+        print(f"Using a mixture of datasets: {dataset_names}")
+        mixture_name = "+".join(sorted(dataset_names))
+        # Create a new mixture specification with equal weighting
+        mixture_spec = [(name, 1.0) for name in dataset_names]
+        OXE_NAMED_MIXTURES[mixture_name] = mixture_spec
+        # Update cfg.dataset_name to use our new custom mixture
+        cfg.dataset_name = mixture_name
+
+    batch_transform = RLDSBatchTransform(
+        action_tokenizer,
+        processor.tokenizer,
+        image_transform=processor.image_processor.apply_transform,
+        prompt_builder_fn=PurePromptBuilder,
+        use_wrist_image=use_wrist_image,
+        use_proprio=cfg.use_proprio,
+    )
+    train_dataset = RLDSDataset(
+        cfg.data_root_dir,
+        cfg.dataset_name,
+        batch_transform,
+        resize_resolution=tuple(vla.module.config.image_sizes),
+        shuffle_buffer_size=cfg.shuffle_buffer_size,
+        image_aug=cfg.image_aug,
+    )
+    # print(train_dataset)
+    if cfg.use_val_set:
+        val_dataset = RLDSDataset(
+            cfg.data_root_dir,
+            cfg.dataset_name,
+            batch_transform,
+            resize_resolution=tuple(vla.module.config.image_sizes),
+            shuffle_buffer_size=cfg.shuffle_buffer_size // 10,
+            image_aug=cfg.image_aug,
+            train=False,
+        )
+
+    # [Important] Save dataset statistics so that we can unnormalize actions during inference
+    if distributed_state.is_main_process:
+        save_dataset_statistics(train_dataset.dataset_statistics, run_dir)
+
+    # Create collator and dataloader
+    collator = PaddedCollatorForActionPrediction(
+        processor.tokenizer.model_max_length, processor.tokenizer.pad_token_id, padding_side="right"
+    )
+    dataloader = DataLoader(
+        train_dataset,
+        batch_size=cfg.batch_size,
+        sampler=None,
+        collate_fn=collator,
+        num_workers=0,  # Important: Set to 0 if using RLDS, which uses its own parallelism
+    )
+    if cfg.use_val_set:
+        val_batch_size = cfg.batch_size
+        val_dataloader = DataLoader(
+            val_dataset,
+            batch_size=val_batch_size,
+            sampler=None,
+            collate_fn=collator,
+            num_workers=0,  # Important: Set to 0 if using RLDS, which uses its own parallelism
+        )
+
+    # Deque to store recent train metrics (used for computing smoothened metrics for gradient accumulation)
+    recent_metrics = {
+        "total_loss": deque(maxlen=cfg.grad_accumulation_steps),
+        "loss_value": deque(maxlen=cfg.grad_accumulation_steps),
+        "curr_action_accuracy": deque(maxlen=cfg.grad_accumulation_steps),
+        "curr_action_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
+        "next_actions_accuracy": deque(maxlen=cfg.grad_accumulation_steps),
+        "next_actions_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
+        "align_loss": deque(maxlen=cfg.grad_accumulation_steps),
+    }
+
+    # Add deques for individual alignment losses (layer pairs)
+    for i in range(len(cfg.vla_layers_align)):
+        recent_metrics[f"align_loss_layer_{i}_avg"] = deque(maxlen=cfg.grad_accumulation_steps)
+        # Add deques for each ensemble member in this layer
+        for j in range(cfg.ensemble_size):
+            recent_metrics[f"align_loss_layer_{i}_ens_{j}"] = deque(maxlen=cfg.grad_accumulation_steps)
+
+    # Add deques for average projector losses across layers
+    for j in range(cfg.ensemble_size):
+         recent_metrics[f"align_loss_projector_{j}_avg"] = deque(maxlen=cfg.grad_accumulation_steps)
+
+    # Start training
+    samples_profiled = 0
+    profiling_data = [] # List to store profiling results
+
+    with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
+        vla.train()
+        optimizer.zero_grad()
+        for batch_idx, batch in enumerate(dataloader):
+            # Determine current step and profiling status BEFORE forward pass
+            _grad_step_idx = batch_idx // cfg.grad_accumulation_steps
+            _current_step = _grad_step_idx if not cfg.resume else (cfg.resume_step or 0) + _grad_step_idx
+            is_profiling = _current_step >= cfg.profiling_start_step
+
+            # Compute training metrics and loss
+            compute_diffusion_l1 = cfg.use_diffusion and batch_idx % cfg.diffusion_sample_freq == 0
+            loss, metrics, individual_align_losses = run_forward_pass(
+                vla=vla,
+                action_head=action_head,
+                noisy_action_projector=noisy_action_projector if cfg.use_diffusion else None,
+                proprio_projector=proprio_projector if cfg.use_proprio else None,
+                align_projectors=align_projectors if cfg.align_loss_type in ["cosine"] else None,
+                vggt=vggt_model,
+                pooling_func=cfg.pooling_func,
+                vla_layers_align=cfg.vla_layers_align,
+                vggt_layers_align=cfg.vggt_layers_align,
+                use_vggt_pe=cfg.use_vggt_pe,
+                gain_feat_1move=cfg.gain_feat_1move,
+                processor=processor,
+                batch=batch,
+                action_tokenizer=action_tokenizer,
+                device_id=device_id,
+                align_loss_coeff=cfg.align_loss_coeff,
+                use_l1_regression=cfg.use_l1_regression,
+                use_diffusion=cfg.use_diffusion,
+                use_proprio=cfg.use_proprio,
+                use_film=cfg.use_film,
+                num_patches=NUM_PATCHES,
+                num_images_in_input=cfg.num_images_in_input,
+                compute_diffusion_l1=compute_diffusion_l1,
+                num_diffusion_steps_train=cfg.num_diffusion_steps_train if cfg.use_diffusion else None,
+                use_vggt_cache=cfg.use_vggt_cache,
+                generate_vggt_cache=cfg.generate_vggt_cache,
+                vggt_cache_dir=cfg.vggt_cache_dir,
+                return_individual_losses=is_profiling,
+            )
+
+            # Profiling Logic
+            if is_profiling:
+                if align_projectors is not None:
+                    print(f"\n[Profiling] Step {_current_step} (Sample {samples_profiled + 1}/{cfg.profiling_num_samples}): Computing Gradient Conflict...")
+                    # Target parameters: VLA Backbone (LoRA) instead of Projector
+                    target_params = []
+                    try:
+                        # Find LoRA Linear layers in the language model
+                        lora_modules = []
+                        for name, mod in vla.named_modules():
+                            if "lora" in name and isinstance(mod, nn.Linear):
+                                lora_modules.append((name, mod))
+                        
+                        if lora_modules:
+                            # Debug: print first few found modules to help user select
+                            print(f"[Profiling] Found {len(lora_modules)} LoRA modules.")
+                            
+                            # Determine which modules to profile based on profiling_target_module
+                            target_params = []
+                            monitored_names = []
+                            
+                            if cfg.profiling_target_module == "llm_block_0":
+                                print("[Profiling] Mode: llm_block_0. Searching for ALL LoRA parameters in LLM Transformer Block 0...")
+                                # Keyword to identify the first block. 
+                                # Standard Llama/OpenVLA structure: model.layers.0.self_attn...
+                                block_pattern = "layers.0."
+                                
+                                for name, mod in lora_modules:
+                                    # 1. Exclude Vision Backbone and Projector
+                                    if "vision_backbone" in name or "featurizer" in name or "projector" in name:
+                                        continue
+                                    
+                                    # 2. Check if it belongs to Layer 0
+                                    if block_pattern in name:
+                                        monitored_names.append(name)
+                                        target_params.extend(list(mod.parameters()))
+                                        
+                            elif cfg.profiling_target_module == "projector":
+                                print("[Profiling] Mode: projector. Searching for LoRA parameters in the Projector...")
+                                # The projector usually connects vision backbone to LLM
+                                # In OpenVLA, it's often named 'projector' or inside 'vision_backbone' if fused, 
+                                # but here we look for the standalone projector module logic.
+                                # Actually, OpenVLA's projector is often 'model.projector' or 'model.mm_projector'
+                                
+                                for name, mod in lora_modules:
+                                    if "projector" in name:
+                                        monitored_names.append(name)
+                                        target_params.extend(list(mod.parameters()))
+                            
+                            else:
+                                print(f"[Profiling] Mode: Custom pattern '{cfg.profiling_target_module}'")
+                                for name, mod in lora_modules:
+                                    if cfg.profiling_target_module in name:
+                                        monitored_names.append(name)
+                                        target_params.extend(list(mod.parameters()))
+
+                            if target_params:
+                                print(f"[Profiling] Successfully selected {len(monitored_names)} LoRA modules.")
+                                # Print first few to confirm
+                                print(f"[Profiling] Examples: {monitored_names[:3]} ...")
+                                print(f"[Profiling] Total param groups monitored: {len(target_params)}")
+                            else:
+                                print(f"[Profiling] Warning: Could not find modules matching mode '{cfg.profiling_target_module}'. Falling back to default single layer.")
+                                # Fallback logic...
+                                found_valid = False
+                                for idx, (name, mod) in enumerate(lora_modules):
+                                    if "vision_backbone" not in name and "featurizer" not in name:
+                                        # Prefer lora_B
+                                        if "lora_B" in name:
+                                            target_idx = idx
+                                            found_valid = True
+                                            break
+                                
+                                # If still not found, just take first one
+                                if not found_valid: target_idx = 0
+                                    
+                                target_name, target_mod = lora_modules[target_idx]
+                                
+                                # Logic to include both LoRA A and LoRA B in the target parameters
+                                pair_target_name = None
+                                pair_target_mod = None
+                                
+                                if "lora_A" in target_name:
+                                    pair_name = target_name.replace("lora_A", "lora_B")
+                                elif "lora_B" in target_name:
+                                    pair_name = target_name.replace("lora_B", "lora_A")
+                                else:
+                                    pair_name = None
+                                    
+                                if pair_name:
+                                    for nm, mod in lora_modules:
+                                        if nm == pair_name:
+                                            pair_target_name = nm
+                                            pair_target_mod = mod
+                                            break
+                                
+                                print(f"[Profiling] Fallback Monitoring LoRA layer: {target_name}")
+                                target_params = list(target_mod.parameters())
+                                if pair_target_mod:
+                                    print(f"[Profiling] Also monitoring paired LoRA layer: {pair_target_name}")
+                                    target_params.extend(list(pair_target_mod.parameters()))
+
+                            # DEBUG info
+                            
+                            # DEBUG info
+                            if individual_align_losses:
+                                print(f"[Profiling] Loss requires_grad: {individual_align_losses[0].requires_grad}")
+                                print(f"[Profiling] Target params requires_grad: {[p.requires_grad for p in target_params]}")
+                        
+                        # Fallback if no LoRA found (e.g. full finetune or different naming)
+                        if not target_params:
+                            print("[Profiling] No LoRA layer found, trying Vision Backbone...")
+                            for p in vla.module.vision_backbone.parameters():
+                                if p.requires_grad:
+                                    target_params.append(p)
+                                    if len(target_params) >= 2: break
+                                    
+                        if not target_params:
+                             print("[Profiling] Fallback: Monitoring first trainable VLA params")
+                             target_params = [p for p in vla.parameters() if p.requires_grad][:2]
+
+                    except Exception as e:
+                        print(f"[Profiling] Error finding params: {e}")
+                    
+                    if target_params and individual_align_losses:
+                        # Iterate through each sample in the batch individually if possible?
+                        # individual_align_losses is currently averaged over batch.
+                        # Wait, run_forward_pass returns individual_align_losses which are layer averages.
+                        # The current implementation of AlignProjector.compute_align_loss_cosine does reduce across batch:
+                        # align_loss /= bsz
+                        
+                        # To profile multiple samples separately, we need run_forward_pass to return per-sample losses,
+                        # OR we need to accept that we are profiling the "batch gradient".
+                        # If the user wants to profile multiple batches, the current loop structure handles it.
+                        # Each batch (size 8 in script) produces ONE gradient update (and one cosine matrix).
+                        # If the user meant "record multiple batches", the current code does record multiple ENTRIES in profiling_data,
+                        # one per batch loop iteration.
+                        
+                        # BUT, looking at the code structure:
+                        # `is_profiling` becomes true.
+                        # We compute `run_forward_pass`.
+                        # We compute gradient conflict on `individual_align_losses`.
+                        # We append to `profiling_data`.
+                        # We increment `samples_profiled`.
+                        # We check if `samples_profiled >= target`.
+                        # If not, we `continue` (loop to next batch).
+                        
+                        # So yes, it SHOULD record multiple batches if profiling_num_samples > batch_size.
+                        # In the previous script execution, profiling_num_samples was 8, and batch_size was 8.
+                        # So it ran ONCE (8 >= 8) and exited.
+                        
+                        layer_grads = []
+                        valid_gradients = True
+                        for i, layer_loss in enumerate(individual_align_losses):
+                            try:
+                                grads = torch.autograd.grad(
+                                    layer_loss, target_params, retain_graph=True, allow_unused=True
+                                )
+                                grads_flat = []
+                                for g, p in zip(grads, target_params):
+                                    if g is not None:
+                                        grads_flat.append(g.view(-1))
+                                    else:
+                                        grads_flat.append(torch.zeros_like(p).view(-1))
+                                if grads_flat:
+                                    cat_grads = torch.cat(grads_flat)
+                                    layer_grads.append(cat_grads)
+                                    # Debug
+                                    if cat_grads.abs().sum() == 0:
+                                        print(f"[Profiling] Warning: Gradients for layer {i} are all zero! (grad_fn: {layer_loss.grad_fn})")
+                                else:
+                                    valid_gradients = False
+                            except Exception as e:
+                                print(f"[Profiling] Error computing grad for layer {i}: {e}")
+                                valid_gradients = False
+                        
+                        if valid_gradients and len(layer_grads) > 1:
+                            grad_stack = torch.stack(layer_grads)
+                            grad_norm = grad_stack / (grad_stack.norm(dim=1, keepdim=True) + 1e-8)
+                            cos_sim_matrix = torch.mm(grad_norm, grad_norm.t())
+                            
+                            # Convert to numpy and then to list for JSON serialization
+                            cos_sim_list = cos_sim_matrix.detach().cpu().to(torch.float32).numpy().tolist()
+                            print(f"[Profiling] Gradient Cosine Similarity Matrix:")
+                            print(np.array(cos_sim_list))
+
+                            profiling_data.append({
+                                "step": _current_step,
+                                "sample_idx": samples_profiled + 1,
+                                "cosine_similarity_matrix": cos_sim_list
+                            })
+                
+                # Update profiling counter
+                current_batch_size = batch["input_ids"].shape[0]
+                samples_profiled += current_batch_size
+                
+                # If we have reached the target number of samples, exit
+                if samples_profiled >= cfg.profiling_num_samples:
+                    print(f"[Profiling] Completed {samples_profiled} samples. Saving results and exiting.")
+                    
+                    # Save profiling data to JSON
+                    json_path = run_dir / cfg.profiling_output_file
+                    with open(json_path, 'w') as f:
+                        json.dump(profiling_data, f, indent=4)
+                    print(f"[Profiling] Results saved to {json_path}")
+                    
+                    break
+                
+                # Skip optimization step during profiling
+                # We also skip standard backward pass to avoid updating weights
+                # But we still need to update progress bar manually or just continue
+                progress.update()
+                continue
+
+            # Normalize loss to account for gradient accumulation
+            normalized_loss = loss / cfg.grad_accumulation_steps
+
+            # Backward pass
+            normalized_loss.backward()
+
+            # Store recent train metrics
+            for metric_name, value in metrics.items():
+                if metric_name in recent_metrics:
+                    recent_metrics[metric_name].append(value)
+
+            # Compute gradient step index
+            gradient_step_idx = batch_idx // cfg.grad_accumulation_steps
+
+            # Compute smoothened train metrics
+            smoothened_metrics = compute_smoothened_metrics(recent_metrics)
+
+            # Push Metrics to W&B (every wandb_log_freq gradient steps)
+            log_step = gradient_step_idx if not cfg.resume else cfg.resume_step + gradient_step_idx
+            if distributed_state.is_main_process and log_step % cfg.wandb_log_freq == 0:
+                log_metrics_to_wandb(smoothened_metrics, "VLA Train", log_step, wandb)
+
+            # [If applicable] Linearly warm up learning rate from 10% to 100% of original
+            if cfg.lr_warmup_steps > 0:
+                lr_progress = min((gradient_step_idx + 1) / cfg.lr_warmup_steps, 1.0)  # Cap at 1.0
+                current_lr = original_lr * (0.1 + 0.9 * lr_progress)
+                for param_group in optimizer.param_groups:
+                    param_group["lr"] = current_lr
+
+            if distributed_state.is_main_process and gradient_step_idx % cfg.wandb_log_freq == 0:
+                # Log the learning rate
+                # Make sure to do this AFTER any learning rate modifications (e.g., warmup/decay)
+                wandb.log(
+                    {
+                        "VLA Train/Learning Rate": scheduler.get_last_lr()[0],
+                    },
+                    step=log_step,
+                )
+
+            # Optimizer and LR scheduler step
+            if (batch_idx + 1) % cfg.grad_accumulation_steps == 0:
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+                progress.update()
+
+            # Save model checkpoint: either keep latest checkpoint only or all checkpoints
+            if gradient_step_idx > 0 and log_step % cfg.save_freq == 0:
+                torch.cuda.empty_cache()
+                save_training_checkpoint(
+                    cfg=cfg,
+                    run_dir=run_dir,
+                    log_step=log_step,
+                    vla=vla,
+                    processor=processor,
+                    proprio_projector=proprio_projector if cfg.use_proprio else None,
+                    noisy_action_projector=noisy_action_projector if cfg.use_diffusion else None,
+                    align_projectors=align_projectors, # Pass the projectors
+                    action_head=action_head if (cfg.use_l1_regression or cfg.use_diffusion) else None,
+                    train_dataset=train_dataset,
+                    distributed_state=distributed_state,
+                )
+
+            # Test model on validation set
+            if cfg.use_val_set and log_step > 0 and log_step % cfg.val_freq == 0:
+                run_validation(
+                    vla=vla,
+                    action_head=action_head,
+                    noisy_action_projector=noisy_action_projector if cfg.use_diffusion else None,
+                    proprio_projector=proprio_projector if cfg.use_proprio else None,
+                    align_projectors=align_projectors if cfg.align_loss_type in ["cosine"] else None,
+                    val_dataloader=val_dataloader,
+                    action_tokenizer=action_tokenizer,
+                    device_id=device_id,
+                    cfg=cfg,
+                    num_patches=NUM_PATCHES,
+                    log_step=log_step,
+                    distributed_state=distributed_state,
+                    val_time_limit=cfg.val_time_limit,
+                    vggt=vggt_model,
+                    processor=processor,
+                )
+                # Set model back to training mode after validation
+                vla.train()
+
+            # Stop training when max_steps is reached
+            if log_step == cfg.max_steps:
+                print(f"Max step {cfg.max_steps} reached! Stopping training...")
+                break
+
+
+if __name__ == "__main__":
+    finetune()
